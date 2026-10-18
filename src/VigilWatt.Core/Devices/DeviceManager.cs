@@ -94,8 +94,46 @@ public sealed class DeviceManager : IDisposable
         return list;
     }
 
-    public IReadOnlyCollection<DeviceStatus> Devices => _devices.Values
-        .OrderByDescending(d => d.IsOnline).ThenBy(d => d.DisplayName).ToList();
+    /// <summary>
+    /// 全部设备，按 在线优先 + 名字排序。**同名设备去重**（2026-10-19 用户需求）：
+    /// 同一只鼠标会同时出现在 2.4G（Hid24G）和蓝牙（Ble）两条通道，主界面/托盘/贴片只显示一条——
+    /// 优先 2.4G（带充电状态，信息更全）；2.4G 不在线时蓝牙那条自动补位，UI 字样随通道在"2.4G/蓝牙"间切换。
+    /// 同名匹配按显示名归一（去首尾空格、忽略大小写）；同名不同实体（两只同型号鼠标）会被误合并，目前用户只有一只，接受此限制。
+    /// </summary>
+    public IReadOnlyCollection<DeviceStatus> Devices
+    {
+        get
+        {
+            var all = _devices.Values
+                .OrderByDescending(d => d.IsOnline).ThenBy(d => d.DisplayName).ToList();
+
+            // 每个名字组：先挑"在线的 2.4G"，其次"在线的蓝牙"，最后任意一条（离线历史）；
+            // 组内其余条目全部隐藏。
+            var hidden = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var group in all.GroupBy(d => NormalizeName(d.Name)))
+            {
+                if (group.Count() < 2) continue;
+                var keep =
+                    group.FirstOrDefault(d => d.IsOnline && d.Source == DeviceSource.Hid24G) ??
+                    group.FirstOrDefault(d => d.IsOnline && d.Source == DeviceSource.Ble) ??
+                    group.First();
+                // 类型继承：被隐藏的条目可能带着插件显式声明的类型（如 HECATE 2.4G 声明 Kind=Mouse），
+                // 而保留条目若靠名字猜（蓝牙通道）猜不出型号词（"G5M" 不在词表）会落 Unknown → 蓝牙兜底图标。
+                // 合并时把组内任一非 Unknown 的类型传给保留条目，双模设备两条通道显示同一图标（2026-10-19）。
+                var declaredKind = group.Select(d => d.Kind).FirstOrDefault(k => k != DeviceKind.Unknown);
+                if (declaredKind != DeviceKind.Unknown && keep.Kind == DeviceKind.Unknown)
+                    keep.Kind = declaredKind;
+
+                foreach (var d in group)
+                    if (!ReferenceEquals(d, keep))
+                        hidden.Add(d.Id);
+            }
+
+            return all.Where(d => !hidden.Contains(d.Id)).ToList();
+        }
+    }
+
+    private static string NormalizeName(string name) => name.Trim();
 
     public DeviceStatus? Find(string id) => _devices.TryGetValue(id, out var d) ? d : null;
 
