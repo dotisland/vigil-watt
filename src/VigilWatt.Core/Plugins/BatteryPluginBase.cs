@@ -38,6 +38,14 @@ public abstract class BatteryPluginBase : IBatteryPlugin
     protected void RaiseStatusPushed(DeviceStatus status) => StatusPushed?.Invoke(status);
 
     /// <summary>
+    /// 认领时拿不到读数（percent=null）是否意味着设备离线。
+    /// 默认 true：北通手柄关机后只剩 dongle，假装在线会让设备列表说谎。
+    /// HECATE 覆写为 false：全新 2.4G 链路的电量推送是休眠的（要官方软件发查询才唤醒），
+    /// 设备本身真实在线（指针正常）——标离线会让贴片/列表把它整个藏掉，用户反而不知道该去唤醒（2026-10-19）。
+    /// </summary>
+    protected virtual bool NullPercentMeansOffline => true;
+
+    /// <summary>
     /// 认领成功后是否启动后台被动监听（只读不写）。
     /// 雷柏心跳 / 迈从 0A 推送 / 北通 T9 流 等覆盖为 true，并实现 <see cref="TryParsePassiveInput"/>。
     ///
@@ -198,6 +206,9 @@ public abstract class BatteryPluginBase : IBatteryPlugin
                 gone.Status.IsOnline = false;
                 _claims.Release(path, Name);
                 Log.Info($"{DisplayName} 设备已移除: {path}");
+                // 必须把离线状态上报给 DeviceManager：它只 Upsert 本方法返回的条目，
+                // 不上报的话设备会永远显示在线（2026-10-18 实测：鼠标关机后托盘一直显示 98%）。
+                claimed.Add(gone.Status);
             }
         }
 
@@ -262,9 +273,9 @@ public abstract class BatteryPluginBase : IBatteryPlugin
                 Protocol = protocol,
                 BatteryPercent = percent,
                 Charging = charging,
-                // 认领了却拿不到读数 = 设备在位但不可读（如北通手柄已关机、只剩 dongle），
-                // 这时**必须标离线**：假装在线会让设备列表说谎。
-                IsOnline = percent.HasValue,
+                // 认领了却拿不到读数：默认标离线（见 <see cref="NullPercentMeansOffline"/>），
+                // 但覆写了该属性的插件（HECATE 休眠态）保持在线，UI 显示 "--" + 唤醒提示。
+                IsOnline = percent.HasValue || !NullPercentMeansOffline,
             };
             var dev = new TrackedDevice
             {
