@@ -61,6 +61,16 @@ public sealed class TaskbarPillWindow : IDisposable
     private bool _tipVisible;
     private bool _hoverArmed;
 
+    /// <summary>上一帧的"占位签名"（谁在任务栏上、占多宽）。变了就重新量空隙、重新决定画几台。</summary>
+    private string _occSignature = string.Empty;
+
+    /// <summary>无在线设备时贴片整体隐藏（隐藏中为 true）。隐藏期间按钮区还原，不留空位。</summary>
+    private bool _pillHidden;
+
+    /// <summary>被收窄过的任务列表窗口（历史版本遗留，保留还原能力）。</summary>
+    private IntPtr _taskListHwnd;
+    private Native.RECT? _taskListOriginal;
+
     public TaskbarPillWindow()
     {
         _current = this;
@@ -247,6 +257,7 @@ public sealed class TaskbarPillWindow : IDisposable
 
     private void ReleaseWindow()
     {
+        RestoreTaskList();   // 收窄过的任务列表必须还原，不能把别人的任务栏改残了再退出
         ReleaseTipWindow();
         if (_hwnd != IntPtr.Zero)
         {
@@ -318,8 +329,56 @@ public sealed class TaskbarPillWindow : IDisposable
             }
         }
 
-        if (_needRender || _bitmap == null) Render();
-        ApplyPosition();
+        Layout();
+    }
+
+    /// <summary>
+    /// 收集占位 → 量空隙 → 决定画几台 → 落位。占位签名没变且不需要重画时，只重摆位置不重画。
+    /// "画几台"由空间决定：托盘左侧的空隙放不下当前配置就一档一档收窄（N→1），
+    /// 保证 BatteryBar、TrafficMonitor 这类也在任务栏安家的工具永远不会再被叠住。
+    /// </summary>
+    private void Layout()
+    {
+        if (_pillH <= 0) return;
+
+        // 没有任何在线设备时把贴片整体藏起来：显示"暂无在线设备"占位只会白占一截任务栏，
+        // 用户看到的就是一块空格。隐藏同时还原按钮区，设备上线时再出现并重新限长。
+        bool anyOnline = App.Services.Manager.Devices.Any(d => d.IsOnline && d.Source != DeviceSource.System);
+        if (!anyOnline)
+        {
+            if (!_pillHidden)
+            {
+                _pillHidden = true;
+                Native.ShowWindow(_hwnd, Native.SW_HIDE);
+                if (_taskListOriginal.HasValue) RestoreTaskList();
+                Log.Info("无在线设备，贴片已隐藏，任务按钮区已还原");
+            }
+            return;
+        }
+        if (_pillHidden)
+        {
+            _pillHidden = false;
+            Native.ShowWindow(_hwnd, Native.SW_SHOWNOACTIVATE);
+            Log.Info("设备上线，贴片恢复显示");
+        }
+
+        int gap = (int)Math.Round(EdgeGapDip * Scale);
+        var occupied = TaskbarOccupancy.Collect(_taskbar, _hwnd);
+        int avail = TaskbarLayout.WidestGap(_taskbarRect, _trayRect, occupied, gap);
+        string sig = $"{avail}|{string.Join(",", occupied.Select(r => r.Left))}";
+
+        if (_needRender || _bitmap == null || sig != _occSignature)
+        {
+            _occSignature = sig;
+            int maxDev = TaskbarBatteryOptions.Clamp(App.Services.Settings.TaskbarBatteryMaxDevices);
+            for (int k = maxDev; k >= 1; k--)
+            {
+                Render(k);
+                if (_pillW <= avail) break;   // 放得下就停；放不下继续收窄，1 台是底线
+            }
+        }
+
+        ApplyPosition(occupied, gap);
     }
 
     /// <summary>找任务栏与托盘矩形（物理像素、屏幕坐标）；<paramref name="hidden"/> 表示自动隐藏已收起。</summary>
@@ -346,11 +405,11 @@ public sealed class TaskbarPillWindow : IDisposable
         return true;
     }
 
-    private void Render()
+    private void Render(int limit)
     {
         if (_pillH <= 0) return;   // 还没算出任务栏厚度，等下一拍
 
-        var devices = SelectDevices(out var overflowNames);
+        var devices = SelectDevices(out var overflowNames, limit);
         var bmp = TaskbarPillRenderer.Render(
             devices, overflowNames,
             devices.ToDictionary(d => d.Id, d => App.Services.Manager.GetRemainingTimeEstimate(d)),
@@ -372,7 +431,7 @@ public sealed class TaskbarPillWindow : IDisposable
     /// 取要显示的设备。**本机电量恒定排除**：Windows 任务栏自己已经有一个电池图标，
     /// 再在贴片上重复一遍只是噪音（与托盘"最低电量"不统计本机是同一个理由）。
     /// </summary>
-    private static List<DeviceStatus> SelectDevices(out IReadOnlyList<string> overflowNames)
+    private static List<DeviceStatus> SelectDevices(out IReadOnlyList<string> overflowNames, int limit)
     {
         overflowNames = Array.Empty<string>();
         var all = App.Services.Manager.Devices
@@ -386,27 +445,89 @@ public sealed class TaskbarPillWindow : IDisposable
         if (TaskbarBatteryMode.Normalize(App.Services.Settings.TaskbarBatteryMode) == TaskbarBatteryMode.Lowest)
             return all.Count > 0 ? [all[0]] : [];
 
-        int max = TaskbarBatteryOptions.Clamp(App.Services.Settings.TaskbarBatteryMaxDevices);
+        // limit 是"空间决定的上限"，设置里的 maxDevices 是用户意愿，两者取小
+        int max = Math.Min(
+            TaskbarBatteryOptions.Clamp(App.Services.Settings.TaskbarBatteryMaxDevices),
+            Math.Max(1, limit));
         if (all.Count <= max) return all;
         overflowNames = all.Skip(max).Select(d => d.DisplayName).ToList();
         return all.GetRange(0, max);
     }
 
-    private void ApplyPosition()
+    private void ApplyPosition(IReadOnlyList<PixelRect> occupied, int gap)
     {
         if (_bitmap == null || _pillW == 0 || _pillH == 0) return;
 
-        int gap = (int)Math.Round(EdgeGapDip * Scale);
         int placeOffset = OffsetForCurrentDpi(out _);
-        var (x, y) = TaskbarLayout.Place(_taskbarRect, _trayRect, _pillW, _pillH, placeOffset, gap, out int applied);
+
+        // 在"托盘左侧可用带"的真实空隙里挑位：默认位被占就走最靠右的空档，空档都不够宽才挤最宽的那个
+        var (x, y) = TaskbarLayout.PlaceInGap(
+            _taskbarRect, _trayRect, occupied, _pillW, _pillH, placeOffset, gap, out int applied, out bool overlaps);
+        // 只在占位集合/落点变化时记一行，方便事后核对"到底让开了谁"（InfoOnChange 内部去重，不刷屏）
+        Log.InfoOnChange("taskbar-occupy",
+            $"{string.Join("|", occupied.Select(r => $"{r.Left}-{r.Right}"))}@{x}",
+            $"任务栏占位: {occupied.Count} 块 [{string.Join(", ", occupied.Select(r => $"{r.Left}-{r.Right}"))}]，贴片宽 {_pillW}，落点 x={x}" +
+            (overlaps ? "（空隙不足，存在重叠）" : string.Empty));
         // 过渡帧（拔插显示器时任务栏/托盘矩形短暂错位）也会夹紧；只有拖动中才把夹紧结果写回记忆，
         // 否则分辨率往返后用户偏移会被污染。反推写回语义见 docs/dev/runtime-pitfalls.md §16.5。
         if (_dragging) _offsetPx = applied;
+
+        // 应用按钮区限长（用户决策：只要求跟 BatteryBar 共存）：把任务列表右端收到
+        // "最靠左的第三方占位窗口（或托盘）− 间隙×2 − 贴片宽"，贴片坐在按钮区与它之间，永不压图标。
+        // 注意锚点是**最靠左的占位窗口**而不是托盘——BatteryBar 挡在中间时按托盘算会把按钮区留到贴片底下。
+        // TrafficMonitor 在场时必须让路（它也在收窄同一个窗口，两边同写会振荡，§16 实测），只做避让。
+        CarveBeforeTray(gap, occupied);
 
         // 子窗口的坐标是**相对父窗口客户区**的，定位数学算出来的是屏幕坐标，这里换算一次
         var pt = new Native.POINT { X = x, Y = y };
         Native.ScreenToClient(_taskbar, ref pt);
         Upload(pt.X, pt.Y);
+    }
+
+    /// <summary>
+    /// 给应用按钮区限长：任务列表右端收到 "BatteryBar/托盘左边 − 间隙×2 − 贴片宽"，
+    /// 贴片落在按钮区与 BatteryBar 之间的空档；TrafficMonitor 在场时改为还原（让路，防振荡）。
+    /// 关键不变量：目标只取决于 <see cref="_pillW"/> 与托盘位置（都是常量级输入），
+    /// 每帧重算结果相同 → 稳态零 MoveWindow，不会振荡。
+    /// </summary>
+    private void CarveBeforeTray(int gap, IReadOnlyList<PixelRect> occupied)
+    {
+        if (!_taskbarHorizontal) return;
+
+        var list = TaskbarOccupancy.FindTaskList(_taskbar);
+        if (list == IntPtr.Zero) return;
+        if (list != _taskListHwnd)
+        {
+            // Explorer 重建了任务列表：旧备份作废，重新从当前矩形记原始宽度
+            _taskListHwnd = list;
+            _taskListOriginal = null;
+        }
+
+        if (TaskbarOccupancy.HasTrafficMonitor(_taskbar))
+        {
+            if (_taskListOriginal.HasValue) RestoreTaskList();
+            return;
+        }
+
+        if (!Native.GetWindowRect(list, out var r)) return;
+        int rightEdge = _trayRect.Width > 0 ? _trayRect.Left : _taskbarRect.Right;
+        foreach (var o in occupied)
+            if (o.Left < rightEdge && o.Right > r.Left) rightEdge = o.Left;   // 最靠左的占位窗口
+        int targetRight = rightEdge - gap * 2 - _pillW;
+        Log.InfoOnChange("taskbar-carve", $"{targetRight}",
+            $"按钮区限长: 目标右端={targetRight} 当前右端={r.Right} 右边界锚={rightEdge} 贴片宽={_pillW}");
+        TaskbarOccupancy.Reserve(list, targetRight, ref _taskListOriginal);
+    }
+
+    /// <summary>还原被收窄的任务列表（历史版本可能收窄过且崩溃残留；退出/重建窗口时也必须回原状）。</summary>
+    private void RestoreTaskList()
+    {
+        if (_taskListHwnd == IntPtr.Zero || !Native.IsWindow(_taskListHwnd))
+        {
+            _taskListOriginal = null;
+            return;
+        }
+        TaskbarOccupancy.Reserve(_taskListHwnd, int.MaxValue, ref _taskListOriginal);
     }
 
     /// <summary>把记下的偏移换算成当前任务栏 DPI 下的物理像素；旧配置 Dpi=0 时首次只绑定、不改像素。</summary>
@@ -578,7 +699,7 @@ public sealed class TaskbarPillWindow : IDisposable
             var p = Native.GetCursorPos();
             // 只沿任务栏方向拖：横向任务栏走 X，竖向走 Y（斜着拖不会把贴片拽离任务栏）
             _offsetPx = _dragStartOffset + ((_taskbarHorizontal ? p.X : p.Y) - _dragStartCursor);
-            ApplyPosition();
+            Layout();
             return;
         }
 
