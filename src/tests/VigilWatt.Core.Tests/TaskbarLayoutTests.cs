@@ -182,6 +182,140 @@ public class TaskbarLayoutTests
         var (rx, _) = TaskbarLayout.PlaceTooltip(rightBar, rightChip, 120, 28, 4, work);
         Assert.Equal(1720 - 120 - 4, rx);
     }
+
+    // T18：没人占位时，避让版落点必须与旧行为完全一致（回归保护）
+    [Fact]
+    public void PlaceAvoiding_NoObstacles_SameAsPlace()
+    {
+        var (x, y) = TaskbarLayout.PlaceAvoiding(
+            BottomTaskbar, BottomTray, Array.Empty<PixelRect>(), 200, 36, 0, 6, out int applied, out bool blocked);
+
+        Assert.Equal(1700 - 200 - 6, x);
+        Assert.Equal(1038, y);
+        Assert.Equal(0, applied);
+        Assert.False(blocked);
+    }
+
+    // T19：托盘左边被别人占住 → 整块左移，绝不叠上去
+    [Fact]
+    public void PlaceAvoiding_JumpsLeftPastOccupant()
+    {
+        var occupied = new[] { new PixelRect(1400, 1032, 300, 48) };
+        var (x, _) = TaskbarLayout.PlaceAvoiding(
+            BottomTaskbar, BottomTray, occupied, 200, 36, 0, 6, out int applied, out bool blocked);
+
+        Assert.Equal(1400 - 6 - 200, x);
+        Assert.Equal(x - (1700 - 200 - 6), applied);
+        Assert.False(blocked);
+    }
+
+    // T20：只有两个候选位——最右被占就落到"最右那个占位者的左边"，不再继续左移
+    [Fact]
+    public void PlaceAvoiding_FallsBackToSecondSlotOnly()
+    {
+        var occupied = new[]
+        {
+            new PixelRect(1400, 1032, 300, 48),
+            new PixelRect(1100, 1032, 290, 48),
+        };
+        var (x, _) = TaskbarLayout.PlaceAvoiding(
+            BottomTaskbar, BottomTray, occupied, 200, 36, 0, 6, out _, out bool blocked);
+        Assert.Equal(1400 - 6 - 200, x);   // 只跳到最右那个占位者左边，不会再跳到 894
+        Assert.False(blocked);
+    }
+
+    // T21：别的显示器上的矩形（纵向完全不相交）不参与避让
+    [Fact]
+    public void PlaceAvoiding_IgnoresOccupantsOnOtherMonitors()
+    {
+        var occupied = new[] { new PixelRect(1400, 0, 300, 48) };
+        var (x, _) = TaskbarLayout.PlaceAvoiding(
+            BottomTaskbar, BottomTray, occupied, 200, 36, 0, 6, out _, out _);
+
+        Assert.Equal(1700 - 200 - 6, x);
+    }
+
+    // T22：一路撞到任务栏左端仍放不下 → 标记 blocked，交给调用方去收窄任务列表
+    [Fact]
+    public void PlaceAvoiding_MarksBlockedAtLeftEdge()
+    {
+        var occupied = new[] { new PixelRect(10, 1032, 1700, 48) };
+        var (x, _) = TaskbarLayout.PlaceAvoiding(
+            BottomTaskbar, BottomTray, occupied, 200, 36, 0, 6, out _, out bool blocked);
+
+        Assert.Equal(TaskbarLayout.EdgeInsetPx, x);
+        Assert.True(blocked);
+    }
+
+    // 以下为空隙版定位（PlaceInGap / WidestGap）：多工具共存时的真实排布数学。
+    // 场景取自实机：2560 宽任务栏，TM 与 BatteryBar 在托盘左侧各占一段。
+
+    private static readonly PixelRect WideTaskbar = new(0, 1032, 2560, 48);
+    private static readonly PixelRect WideTray = new(2345, 1032, 215, 48);
+
+    // T23：相邻占位之间只留出 gap 就算一条空隙，其余是完整可用带
+    [Fact]
+    public void Gaps_MergeAdjacentOccupantsIntoOneBlock()
+    {
+        var occupied = new[]
+        {
+            new PixelRect(1700, 1032, 150, 48),   // 1700–1850
+            new PixelRect(1860, 1032, 80, 48),    // 1860–1940，与上一个间隔 10px < 2*gap → 合并成一整块
+        };
+        var gaps = TaskbarLayout.Gaps(WideTaskbar, WideTray, occupied, 6);
+
+        Assert.Equal(2, gaps.Count);
+        Assert.Equal((TaskbarLayout.EdgeInsetPx, 1694), (gaps[0].Left, gaps[0].Right));  // 占位块左边
+        Assert.Equal((1946, 2345 - 6), (gaps[1].Left, gaps[1].Right));                   // 占位块右边到托盘
+        Assert.Equal(1694 - TaskbarLayout.EdgeInsetPx, TaskbarLayout.WidestGap(WideTaskbar, WideTray, occupied, 6));   // 最宽的是左边那条
+    }
+
+    // T24：没有占位时，PlaceInGap 落点与旧 Place 完全一致（贴托盘左边）——回归保护
+    [Fact]
+    public void PlaceInGap_NoObstacles_SameAsPlace()
+    {
+        var (x, _) = TaskbarLayout.PlaceInGap(
+            WideTaskbar, WideTray, Array.Empty<PixelRect>(), 200, 36, 0, 6, out _, out bool overlaps);
+
+        Assert.Equal(2345 - 200 - 6, x);
+        Assert.False(overlaps);
+    }
+
+    // T25：默认位被占 → 走能放下的最靠右空档（离托盘最近），而不是一路飘到最左
+    [Fact]
+    public void PlaceInGap_UsesRightmostFittingGap()
+    {
+        var occupied = new[] { new PixelRect(2200, 1032, 139, 48) };   // 2194–2339（含 gap），堵死默认位
+        var (x, _) = TaskbarLayout.PlaceInGap(
+            WideTaskbar, WideTray, occupied, 200, 36, 0, 6, out _, out bool overlaps);
+
+        Assert.Equal(2194 - 200, x);   // 唯一空档 [4,2194)，右对齐落位
+        Assert.False(overlaps);
+    }
+
+    // T26：所有空档都不够宽 → 塞进最宽的空档并标记 overlaps（调用方应先尝试收窄显示台数）
+    [Fact]
+    public void PlaceInGap_MarksOverlapWhenNoGapFits()
+    {
+        var occupied = new[] { new PixelRect(10, 1032, 2300, 48) };    // 盖满可用带
+        var (x, _) = TaskbarLayout.PlaceInGap(
+            WideTaskbar, WideTray, occupied, 200, 36, 0, 6, out _, out bool overlaps);
+
+        Assert.True(overlaps);
+        Assert.Equal(2345 - 6 - 200, x);   // 夹回可用带内（宁可叠障碍物，不压托盘）
+    }
+
+    // T27：用户拖动偏移落在空档内时依然生效（偏移优先于"最靠右空档"）
+    [Fact]
+    public void PlaceInGap_HonorsUserOffsetInsideGap()
+    {
+        var occupied = new[] { new PixelRect(1000, 1032, 200, 48) };   // 994–1206
+        var (x, _) = TaskbarLayout.PlaceInGap(
+            WideTaskbar, WideTray, occupied, 200, 36, -300, 6, out _, out bool overlaps);
+
+        Assert.Equal(2139 - 300, x);   // 锚点 2345-6-200=2139，偏移 -300 后仍落在右空档 [1206,2339) 内
+        Assert.False(overlaps);
+    }
 }
 
 /// <summary>任务栏贴片的两个设置项收敛（T10–T12）：手改坏了的 settings.json 不能把界面带崩。</summary>

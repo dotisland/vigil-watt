@@ -69,6 +69,169 @@ public static class TaskbarLayout
         return (centeredX, y);
     }
 
+    /// <summary>
+    /// 避开已被占用的矩形之后的落点：从"紧贴托盘左边"起步，一旦和 <paramref name="occupied"/> 相交，
+    /// 就把右边界收到该障碍物左边（再重试），直到不再相交或被任务栏左端夹住。
+    /// 语义是"**宁可往左挪，也不叠在别人身上**"——让贴片和 TrafficMonitor、资讯和兴趣小组件共存。
+    /// <paramref name="blocked"/> 为 true 表示已经被夹到任务栏左端、仍有重叠（调用方据此再让任务列表收窄）。
+    /// </summary>
+    public static (int X, int Y) PlaceAvoiding(
+        PixelRect taskbar, PixelRect tray, IReadOnlyList<PixelRect> occupied,
+        int pillW, int pillH, int offset, int gapPx, out int appliedOffset, out bool blocked)
+    {
+        blocked = false;
+
+        // 竖向任务栏（贴片上下排）暂不参与避让：那条路上连"托盘矩形的宽"都可能为 0，先保持原行为
+        if (!IsHorizontal(taskbar))
+        {
+            var (px, py) = Place(taskbar, tray, pillW, pillH, offset, gapPx, out appliedOffset);
+            return (px, py);
+        }
+
+        int y = taskbar.Top + (taskbar.Height - pillH) / 2;
+        int min = taskbar.Left + EdgeInsetPx;
+        int anchor = (tray.Width > 0 ? tray.Left : taskbar.Right) - pillW - gapPx;
+
+        // 只有两个候选位，二选一，不做逐个左移：
+        //   ① 最右：紧贴托盘左边（默认位）
+        //   ② 最左：最靠右那个占位窗口的左边
+        // 逐个左移会让贴片漂到任务按钮中间，位置随开着的程序变，用户没法预期。
+        int slotRight = anchor + pillW + offset;          // 候选 ① 的右边界
+        int slotLeft = int.MinValue;                      // 候选 ② 的右边界
+
+        int x = slotRight - pillW;
+        foreach (var o in occupied)
+        {
+            if (o.Width <= 0 || o.Height <= 0) continue;
+            // 只算同一条任务栏上的障碍物（多显示器时别的屏上的矩形不参与）
+            if (o.Bottom <= taskbar.Top || o.Top >= taskbar.Bottom) continue;
+            if (x >= o.Right || x + pillW <= o.Left) continue;   // 横向不相交
+            if (o.Left - gapPx > slotLeft) slotLeft = o.Left - gapPx;
+        }
+
+        if (slotLeft != int.MinValue) x = slotLeft - pillW;       // ① 被占 → 用 ②
+        if (x < min) { x = min; }                                 // ② 也放不下 → 贴任务栏左端
+        blocked = x == min;
+
+        appliedOffset = x - anchor;
+        return (x, y);
+    }
+
+    /// <summary>
+    /// 空隙列表：把 <paramref name="occupied"/> 合并成区间后，返回"任务栏可用带"里剩余的空档（左闭右开）。
+    /// 可用带 = [任务栏左端+内缩, 托盘左边-gap]；只算与本条任务栏纵向相交的占位。
+    /// 任务栏贴片、TrafficMonitor、BatteryBar、资讯和兴趣小组件都是往这一带里挤，所以空隙要能单独算出来。
+    /// </summary>
+    public static List<(int Left, int Right)> Gaps(
+        PixelRect taskbar, PixelRect tray, IReadOnlyList<PixelRect> occupied, int gapPx)
+    {
+        var result = new List<(int Left, int Right)>();
+        if (!IsHorizontal(taskbar))
+        {
+            int h = (tray.Height > 0 ? tray.Top : taskbar.Bottom) - gapPx;
+            result.Add((taskbar.Top + EdgeInsetPx, Math.Max(taskbar.Top + EdgeInsetPx, h)));
+            return result;
+        }
+
+        int bandLeft = taskbar.Left + EdgeInsetPx;
+        int bandRight = (tray.Width > 0 ? tray.Left : taskbar.Right) - gapPx;
+        if (bandRight <= bandLeft) return result;
+
+        // 只保留与可用带横向相交、且与本条任务栏纵向相交的障碍；按左边界排序后合并
+        var spans = occupied
+            .Where(o => o.Width > 0 && o.Height > 0)
+            .Where(o => o.Bottom > taskbar.Top && o.Top < taskbar.Bottom)
+            .Where(o => o.Right > bandLeft && o.Left < bandRight)
+            .Select(o => (Left: Math.Max(o.Left - gapPx, bandLeft), Right: Math.Min(o.Right + gapPx, bandRight)))
+            .OrderBy(o => o.Left)
+            .ToList();
+
+        int cursor = bandLeft;
+        foreach (var s in spans)
+        {
+            if (s.Left > cursor) result.Add((cursor, Math.Min(s.Left, bandRight)));
+            if (s.Right > cursor) cursor = s.Right;
+        }
+        if (cursor < bandRight) result.Add((cursor, bandRight));
+
+        return result.Where(g => g.Right > g.Left).ToList();
+    }
+
+    /// <summary>可用带里最宽的那个空档有多宽（一像素都没有时返回 0）。调用方据此决定贴片最多能画几台。</summary>
+    public static int WidestGap(
+        PixelRect taskbar, PixelRect tray, IReadOnlyList<PixelRect> occupied, int gapPx)
+    {
+        int best = 0;
+        foreach (var g in Gaps(taskbar, tray, occupied, gapPx))
+            if (g.Right - g.Left > best) best = g.Right - g.Left;
+        return best;
+    }
+
+    /// <summary>
+    /// 在空隙里落位：优先保持"紧贴托盘左边"的默认位；默认位被占就走能放下的**最靠右**的空档；
+    /// 所有空档都放不下时退到最宽的那个（宁可挤进去，也不压到别人身上），并把 <paramref name="overlaps"/> 置 true。
+    /// 相比"遇到障碍就往左跳一次"的两候选位版本，这里是按**真实空隙**挑位，多个工具共存时不会再叠。
+    /// </summary>
+    public static (int X, int Y) PlaceInGap(
+        PixelRect taskbar, PixelRect tray, IReadOnlyList<PixelRect> occupied,
+        int pillW, int pillH, int offset, int gapPx, out int appliedOffset, out bool overlaps)
+    {
+        overlaps = false;
+
+        if (!IsHorizontal(taskbar))
+        {
+            var (px, py) = Place(taskbar, tray, pillW, pillH, offset, gapPx, out appliedOffset);
+            return (px, py);
+        }
+
+        int y = taskbar.Top + (taskbar.Height - pillH) / 2;
+        int bandLeft = taskbar.Left + EdgeInsetPx;
+        int bandRight = (tray.Width > 0 ? tray.Left : taskbar.Right) - gapPx;
+        int anchor = bandRight - pillW;                  // 默认位：右边界贴住可用带右端
+        int preferred = anchor + offset;
+
+        var gaps = Gaps(taskbar, tray, occupied, gapPx);
+
+        // ① 默认位（含用户拖动偏移）落在某个空档里就直接用
+        foreach (var g in gaps)
+        {
+            if (preferred >= g.Left && preferred + pillW <= g.Right)
+            {
+                appliedOffset = preferred - anchor;
+                return (preferred, y);
+            }
+        }
+
+        // ② 从右往左找第一个放得下的空档（离托盘最近）
+        for (int i = gaps.Count - 1; i >= 0; i--)
+        {
+            var g = gaps[i];
+            if (g.Right - g.Left >= pillW)
+            {
+                int x = g.Right - pillW;
+                appliedOffset = x - anchor;
+                return (x, y);
+            }
+        }
+
+        // ③ 都放不下：塞进最宽的空档并标记重叠，调用方会先尝试"少画几台"再来
+        int bestIdx = -1, bestW = -1;
+        for (int i = 0; i < gaps.Count; i++)
+        {
+            int w = gaps[i].Right - gaps[i].Left;
+            if (w > bestW) { bestW = w; bestIdx = i; }
+        }
+
+        overlaps = true;
+        // 夹回可用带内：宁可叠住障碍物，也不能把尾巴伸进托盘区（那里是系统图标，盖了更糟）
+        int maxFallback = Math.Max(bandLeft, bandRight - pillW);
+        int fallback = bestIdx >= 0
+            ? Math.Clamp(gaps[bestIdx].Left, bandLeft, maxFallback)
+            : maxFallback;
+        appliedOffset = fallback - anchor;
+        return (fallback, y);
+    }
+
     /// <summary>把记下偏移时的物理像素换算到当前 DPI；Dpi=0 或未变则原样返回（勿逐帧累乘，见 §16.5）。</summary>
     public static int ScaleOffset(int offsetPx, uint storedDpi, uint currentDpi)
     {
