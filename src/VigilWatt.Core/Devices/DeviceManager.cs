@@ -73,7 +73,19 @@ public sealed class DeviceManager : IDisposable
         _settings = settings;
         _history = history;
         _plugins = DiscoverPlugins();
-        _ble.DeviceUpdated += d => Upsert(d);
+        _ble.DeviceUpdated += d =>
+        {
+            Upsert(d);
+            // 双模切换即时跟随（2026-10-24）：蓝牙通道断开通常意味着鼠标刚切到 2.4G
+            // （固件侧切换是秒级的，HID 输入可证）。立刻触发一次全量轮询，让 2.4G 查询
+            // 在下一个整分钟节拍之前就拿到数据；4 秒后补一次，覆盖切换瞬态。
+            if (!d.IsOnline && d.Source == DeviceSource.Ble)
+            {
+                _ = RequestPollAsync();
+                _ = Task.Delay(TimeSpan.FromSeconds(4))
+                    .ContinueWith(_ => RequestPollAsync(), TaskScheduler.Default);
+            }
+        };
         _classic.DeviceUpdated += Upsert;
         _system.DeviceUpdated += Upsert;
         // 罗技等插件的 HID++ 自发通知（插拔电）不走 60 秒轮询，直接推送
@@ -108,8 +120,57 @@ public sealed class DeviceManager : IDisposable
         return list;
     }
 
-    public IReadOnlyCollection<DeviceStatus> Devices => _devices.Values
-        .OrderByDescending(d => d.IsOnline).ThenBy(d => d.DisplayName).ToList();
+    /// <summary>
+    /// 全部设备，按 在线优先 + 名字排序。**同名设备去重**（2026-10-19 用户需求）：
+    /// 同一只鼠标会同时出现在 2.4G（Hid24G）和蓝牙（Ble）两条通道，主界面/托盘/贴片只显示一条——
+    /// 优先 2.4G（带充电状态，信息更全）；2.4G 不在线时蓝牙那条自动补位，UI 字样随通道在"2.4G/蓝牙"间切换。
+    /// 同名匹配按显示名归一（去首尾空格、忽略大小写）；同名不同实体（两只同型号鼠标）会被误合并，目前用户只有一只，接受此限制。
+    /// </summary>
+    public IReadOnlyCollection<DeviceStatus> Devices
+    {
+        get
+        {
+            var all = _devices.Values
+                .OrderByDescending(d => d.IsOnline).ThenBy(d => d.DisplayName).ToList();
+
+            // 每个名字组：先挑"在线的 2.4G"，其次"在线的蓝牙"，最后任意一条（离线历史）；
+            // 组内其余条目全部隐藏。
+            var hidden = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var group in all.GroupBy(d => NormalizeName(d.Name)))
+            {
+                if (group.Count() < 2) continue;
+                // 保留优先级（2026-10-24 定稿）：有电量数据的在线通道里取最近更新者
+                // （切通道后旧通道过期数据不压实时数据）；都无在线数据时取最近更新者
+                // （关机后保留最后活跃通道）。
+                // 已知限制：拨杆从蓝牙拨向关机时若途经 2.4G 档，会收到一帧真实 2.4G 数据，
+                // 显示会短暂跟随该通道——单帧误触与真实切档在数据层不可区分，写入文档。
+                var withData = group.Where(d => d.IsOnline && d.BatteryPercent.HasValue).ToList();
+                var keep = withData.Count > 0
+                    ? withData.OrderByDescending(d => d.LastUpdated).First()
+                    : group.OrderByDescending(d => d.LastUpdated).First();
+                // 类型继承：被隐藏的条目可能带着插件显式声明的类型（如 HECATE 2.4G 声明 Kind=Mouse），
+                // 而保留条目若靠名字猜（蓝牙通道）猜不出型号词（"G5M" 不在词表）会落 Unknown → 蓝牙兜底图标。
+                // 合并时把组内任一非 Unknown 的类型传给保留条目，双模设备两条通道显示同一图标（2026-10-19）。
+                // 类型继承改为非突变投影：Clone 后替换列表条目，不写回底层对象（getter 副作用修复，CR-68）。
+                var declaredKind = group.Select(d => d.Kind).FirstOrDefault(k => k != DeviceKind.Unknown);
+                if (declaredKind != DeviceKind.Unknown && keep.Kind == DeviceKind.Unknown)
+                {
+                    var projected = keep.Clone();
+                    projected.Kind = declaredKind;
+                    all[all.IndexOf(keep)] = projected;
+                    keep = projected;
+                }
+
+                foreach (var d in group)
+                    if (d.Id != keep.Id)
+                        hidden.Add(d.Id);
+            }
+
+            return all.Where(d => !hidden.Contains(d.Id)).ToList();
+        }
+    }
+
+    private static string NormalizeName(string name) => name.Trim().ToLowerInvariant();
 
     public DeviceStatus? Find(string id) => _devices.TryGetValue(id, out var d) ? d : null;
 

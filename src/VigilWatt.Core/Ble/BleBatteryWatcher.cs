@@ -107,7 +107,7 @@ public sealed class BleBatteryWatcher : IDisposable
             Id = $"ble:{id}",
             Name = name ?? "",
             Source = DeviceSource.Ble,
-            Protocol = "BLE GATT",
+            Protocol = "蓝牙",   // 用户语义：同一只鼠标 2.4G/蓝牙 切换字样（2026-10-19）
         });
         ApplyName(status, name, props);
         if (status.Kind == DeviceKind.Unknown)
@@ -177,6 +177,15 @@ public sealed class BleBatteryWatcher : IDisposable
                 // FromIdAsync 成功且能读 GATT = 设备实际可达，纠正假离线
                 if (ble.ConnectionStatus != BluetoothConnectionStatus.Connected)
                     return;
+
+                // DeviceWatcher 的 Added 事件经常带空 Name（系统还没查到属性），UI 会回退显示原始 Id
+                // （"ble:BluetoothLE#…"，2026-10-19 实测）。打开设备后 OS 已有缓存名，这里补上——
+                // 名字同时是双通道去重（DeviceManager.Devices 按显示名合并）的键，缺失会导致同一只鼠标显示两条。
+                if (string.IsNullOrEmpty(status.Name) && !string.IsNullOrEmpty(ble.Name))
+                {
+                    status.Name = ble.Name;
+                    Log.Info($"BLE 设备名已补全（GATT 缓存）: {status.Name}");
+                }
 
                 var svcResult = await ble
                     .GetGattServicesForUuidAsync(GattServiceUuids.Battery, BluetoothCacheMode.Uncached)
